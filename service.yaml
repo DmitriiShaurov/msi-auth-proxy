@@ -1,0 +1,59 @@
+# MSI Auth Proxy — Kubernetes Service (ClusterIP)
+#
+# Reachable only from within the cluster.
+# DIAL Core's global route should point to this service.
+#
+# ─── DIAL Core route configuration ───────────────────────────────────────────
+#
+# In aidial.config.json add a "routes" block at the top level.
+# The proxy preserves the full request path, so the path you put in the
+# upstream endpoint becomes the path sent to Azure AI Foundry.
+#
+# Example — Azure OpenAI Responses API (/v1/responses):
+#
+#   "routes": {
+#     "azure_responses_api": {
+#       "paths": ["/v1/responses(/.*)?$"],
+#       "methods": ["POST"],
+#       "upstreams": [
+#         {
+#           "endpoint": "http://msi-auth-proxy.dial.svc.cluster.local:8080/openai/v1/responses"
+#         }
+#       ]
+#     }
+#   }
+#
+# Example — Anthropic Messages API (/v1/messages) forwarded to
+# Anthropic-on-Azure (if your Foundry resource exposes it):
+#
+#   "anthropic_messages_api": {
+#     "paths": ["/v1/messages(/.*)?$"],
+#     "methods": ["POST"],
+#     "upstreams": [
+#       {
+#         "endpoint": "http://msi-auth-proxy.dial.svc.cluster.local:8080/openai/v1/messages"
+#       }
+#     ]
+#   }
+#
+# Replace "dial" in the DNS name with the actual namespace if different.
+# ─────────────────────────────────────────────────────────────────────────────
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: msi-auth-proxy
+  namespace: dial
+  labels:
+    app: msi-auth-proxy
+    app.kubernetes.io/name: msi-auth-proxy
+    app.kubernetes.io/component: auth-proxy
+spec:
+  type: ClusterIP
+  selector:
+    app: msi-auth-proxy
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
