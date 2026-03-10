@@ -1,0 +1,200 @@
+# MSI Auth Proxy — Kubernetes Deployment
+#
+# Authentication: AKS Microsoft Entra Workload Identity
+# ──────────────────────────────────────────────────────
+#
+# How Workload Identity works (summary from Microsoft docs):
+#
+#   1. The pod carries the label  azure.workload.identity/use: "true"
+#   2. The AKS mutating admission webhook detects that label and injects:
+#        - AZURE_CLIENT_ID            (from the ServiceAccount annotation)
+#        - AZURE_TENANT_ID            (from the cluster's wi-webhook ConfigMap)
+#        - AZURE_FEDERATED_TOKEN_FILE (path to the projected SA token volume)
+#   3. The application calls DefaultAzureCredential.get_token().
+#      The SDK reads those env vars and exchanges the projected Kubernetes
+#      token for a Microsoft Entra access token via OIDC federation.
+#   4. No IMDS call, no hardcoded secret, no MSI_CLIENT_ID env var needed.
+#
+# Prerequisites — run these once before deploying:
+# ─────────────────────────────────────────────────
+#
+# 1. Enable Workload Identity on the AKS cluster (if not already enabled):
+#      az aks update \
+#        --name <cluster> --resource-group <rg> \
+#        --enable-oidc-issuer --enable-workload-identity
+#
+# 2. Create the managed identity:
+#      az identity create \
+#        --name msi-auth-proxy --resource-group <rg>
+#
+# 3. Get the OIDC issuer URL of the cluster:
+#      OIDC_ISSUER=$(az aks show \
+#        --name <cluster> --resource-group <rg> \
+#        --query "oidcIssuerProfile.issuerUrl" -o tsv)
+#
+# 4. Create a federated identity credential linking the managed identity to
+#    the Kubernetes ServiceAccount below:
+#      az identity federated-credential create \
+#        --name msi-auth-proxy-federation \
+#        --identity-name msi-auth-proxy \
+#        --resource-group <rg> \
+#        --issuer $OIDC_ISSUER \
+#        --subject system:serviceaccount:dial:msi-auth-proxy \
+#        --audience api://AzureADTokenExchange
+#
+# 5. Assign the "Cognitive Services OpenAI User" role to the managed identity
+#    on your Azure AI Foundry resource:
+#      CLIENT_ID=$(az identity show \
+#        --name msi-auth-proxy --resource-group <rg> \
+#        --query clientId -o tsv)
+#
+#      az role assignment create \
+#        --assignee $CLIENT_ID \
+#        --role "Cognitive Services OpenAI User" \
+#        --scope /subscriptions/<sub>/resourceGroups/<rg>/providers/\
+#                Microsoft.CognitiveServices/accounts/<resource-name>
+#
+# 6. Fill in CLIENT_ID in the ServiceAccount annotation below, then apply:
+#      kubectl apply -f deployment.yaml
+#      kubectl apply -f service.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: msi-auth-proxy
+  namespace: dial          # ← change to the namespace where DIAL is deployed
+  annotations:
+    # The webhook reads this annotation to set AZURE_CLIENT_ID in the pod.
+    # Get the value with:
+    #   az identity show --name msi-auth-proxy --resource-group <rg> \
+    #     --query clientId -o tsv
+    azure.workload.identity/client-id: "REPLACE_WITH_MANAGED_IDENTITY_CLIENT_ID"
+  labels:
+    azure.workload.identity/use: "true"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: msi-auth-proxy
+  namespace: dial
+  labels:
+    app: msi-auth-proxy
+    app.kubernetes.io/name: msi-auth-proxy
+    app.kubernetes.io/component: auth-proxy
+spec:
+  replicas: 2
+
+  selector:
+    matchLabels:
+      app: msi-auth-proxy
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+
+  template:
+    metadata:
+      labels:
+        app: msi-auth-proxy
+        app.kubernetes.io/name: msi-auth-proxy
+        # Required: triggers the Workload Identity mutating webhook, which
+        # injects AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_FEDERATED_TOKEN_FILE
+        # and the projected service account token volume into this pod.
+        azure.workload.identity/use: "true"
+
+    spec:
+      serviceAccountName: msi-auth-proxy
+
+      # Prevent both replicas from landing on the same node.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: msi-auth-proxy
+
+      containers:
+        - name: proxy
+          # Replace with your actual image after building and pushing.
+          image: your-registry.azurecr.io/msi-auth-proxy:latest
+          imagePullPolicy: Always
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          env:
+            # ── Required ──────────────────────────────────────────────────────
+            # Base URL of the Azure AI Foundry resource.
+            # The proxy appends the incoming path, so the final upstream URL is:
+            #   TARGET_URL/<path forwarded by DIAL>
+            # e.g.  https://<resource>.openai.azure.com/openai/v1/responses
+            - name: TARGET_URL
+              value: "https://REPLACE_WITH_YOUR_RESOURCE.openai.azure.com"
+
+            # ── Optional ──────────────────────────────────────────────────────
+            # OAuth2 scope for the token request.
+            # https://cognitiveservices.azure.com/.default covers Azure OpenAI
+            # and all Azure AI Foundry endpoints.
+            - name: TOKEN_SCOPE
+              value: "https://cognitiveservices.azure.com/.default"
+
+            - name: LOG_LEVEL
+              value: "info"   # debug | info | warning | error
+
+            # AZURE_CLIENT_ID, AZURE_TENANT_ID, and AZURE_FEDERATED_TOKEN_FILE
+            # are injected automatically by the Workload Identity webhook.
+            # Do NOT set them here.
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            failureThreshold: 3
+
+          readinessProbe:
+            # /readyz calls DefaultAzureCredential.get_token() and returns 503
+            # if the Workload Identity exchange fails, removing the pod from
+            # Service endpoints until authentication recovers.
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3
+
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1001
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
